@@ -1,3 +1,5 @@
+// Package gmail provides a robust and fluent builder API for sending emails
+// via the official Google Gmail v1 API.
 package gmail
 
 import (
