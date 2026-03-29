@@ -21,9 +21,16 @@ import (
 
 // Attachment represents a file to be attached to the email.
 type Attachment struct {
-	Filename string
-	Data     []byte
+	Filename  string
+	Data      []byte
+	IsInline  bool
+	ContentID string
 }
+
+const (
+	// MaxMessageSize is the maximum size of a Gmail message (25MB).
+	MaxMessageSize = 25 * 1024 * 1024
+)
 
 // Message represents an email being built.
 type Message struct {
@@ -98,9 +105,49 @@ func (m *Message) AttachFile(path string) *Message {
 	return m
 }
 
+// EmbedFile adds an inline attachment (e.g., image) with a Content-ID (CID).
+// This allows referencing the image in HTMLBody via <img src="cid:YOUR_CID">.
+func (m *Message) EmbedFile(path string, cid string) *Message {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		m.attachments = append(m.attachments, Attachment{
+			Filename:  filepath.Base(path),
+			Data:      data,
+			IsInline:  true,
+			ContentID: cid,
+		})
+	}
+	return m
+}
+
 // Send finalizes the message, constructs the MIME payload, applies rate-limiting,
-// and dispatches the email via the Gmail API. Return safely on rate limits.
+// and dispatches the email via the Gmail API.
 func (m *Message) Send(ctx context.Context) error {
+	for {
+		err := m.sendOnce(ctx)
+		if err == nil {
+			return nil
+		}
+
+		// Handle AutoRetry if enabled
+		var rlErr *ErrRateLimitExceeded
+		if errors.As(err, &rlErr) && m.client != nil && m.client.autoRetry {
+			wait := time.Until(rlErr.RetryAfter)
+			if wait > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(wait):
+					continue
+				}
+			}
+		}
+
+		return err
+	}
+}
+
+func (m *Message) sendOnce(ctx context.Context) error {
 	if len(m.to) == 0 && len(m.cc) == 0 && len(m.bcc) == 0 {
 		return ErrMissingRecipient
 	}
@@ -122,11 +169,16 @@ func (m *Message) Send(ctx context.Context) error {
 		return fmt.Errorf("failed to build MIME payload: %w", err)
 	}
 
+	// 3. Check Size Limit
+	if len(rawMesg) > MaxMessageSize {
+		return fmt.Errorf("message size %d exceeds Gmail limit of %d bytes", len(rawMesg), MaxMessageSize)
+	}
+
 	gMessage := &gmail.Message{
 		Raw: rawMesg,
 	}
 
-	// 3. Dispatch & Handle 429 Interception
+	// 4. Dispatch & Handle 429 Interception
 	_, err = m.client.srv.Users.Messages.Send("me", gMessage).Context(ctx).Do()
 	if err != nil {
 		return parseAPIError(err)
@@ -153,18 +205,43 @@ func (m *Message) buildMIME() (string, error) {
 	}
 	fmt.Fprintf(buf, "Subject: %s\r\n", m.subject)
 
-	hasAttachments := len(m.attachments) > 0
+	var hasInlines bool
+	var hasRegularAttachments bool
+	for _, a := range m.attachments {
+		if a.IsInline {
+			hasInlines = true
+		} else {
+			hasRegularAttachments = true
+		}
+	}
 
 	var mixedWriter *multipart.Writer
 	var bodyWriter interface{} = buf
 
-	if hasAttachments {
+	if hasRegularAttachments {
 		mixedWriter = multipart.NewWriter(buf)
 		fmt.Fprintf(buf, "Content-Type: multipart/mixed; boundary=\"%s\"\r\n\r\n", mixedWriter.Boundary())
 		bodyWriter = mixedWriter
 	}
 
 	// Internal part handling
+	var relatedWriter *multipart.Writer
+	var contentWriter interface{} = bodyWriter
+
+	if hasInlines {
+		if mw, ok := bodyWriter.(*multipart.Writer); ok {
+			h := make(textproto.MIMEHeader)
+			h.Set("Content-Type", fmt.Sprintf("multipart/related; boundary=\"%s\"", "rel-boundary-"+mixedWriter.Boundary())) // simplified boundary
+			part, _ := mw.CreatePart(h)
+			relatedWriter = multipart.NewWriter(part)
+			contentWriter = relatedWriter
+		} else {
+			relatedWriter = multipart.NewWriter(buf)
+			fmt.Fprintf(buf, "Content-Type: multipart/related; boundary=\"%s\"\r\n\r\n", relatedWriter.Boundary())
+			contentWriter = relatedWriter
+		}
+	}
+
 	if m.textBody != "" && m.htmlBody != "" {
 		// Both text and html, use multipart/alternative
 		altBuf := &bytes.Buffer{}
@@ -174,7 +251,7 @@ func (m *Message) buildMIME() (string, error) {
 		writeTextPart(altWriter, "text/html", m.htmlBody)
 		altWriter.Close()
 
-		if mw, ok := bodyWriter.(*multipart.Writer); ok {
+		if mw, ok := contentWriter.(*multipart.Writer); ok {
 			h := make(textproto.MIMEHeader)
 			h.Set("Content-Type", fmt.Sprintf("multipart/alternative; boundary=\"%s\"", altWriter.Boundary()))
 			part, _ := mw.CreatePart(h)
@@ -184,15 +261,39 @@ func (m *Message) buildMIME() (string, error) {
 			buf.Write(altBuf.Bytes())
 		}
 	} else if m.htmlBody != "" {
-		writeSinglePart(bodyWriter, "text/html", m.htmlBody)
+		writeSinglePart(contentWriter, "text/html", m.htmlBody)
 	} else {
-		writeSinglePart(bodyWriter, "text/plain", m.textBody)
+		writeSinglePart(contentWriter, "text/plain", m.textBody)
 	}
 
-	if hasAttachments {
+	// Write Inline Attachments
+	if hasInlines {
 		for _, attachment := range m.attachments {
+			if !attachment.IsInline {
+				continue
+			}
+			contentType := http.DetectContentType(attachment.Data)
 			h := make(textproto.MIMEHeader)
-			h.Set("Content-Type", fmt.Sprintf("application/octet-stream; name=\"%s\"", attachment.Filename))
+			h.Set("Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, attachment.Filename))
+			h.Set("Content-ID", fmt.Sprintf("<%s>", attachment.ContentID))
+			h.Set("Content-Disposition", "inline")
+			h.Set("Content-Transfer-Encoding", "base64")
+
+			part, _ := relatedWriter.CreatePart(h)
+			writeBase64(part, attachment.Data)
+		}
+		relatedWriter.Close()
+	}
+
+	// Write Regular Attachments
+	if hasRegularAttachments {
+		for _, attachment := range m.attachments {
+			if attachment.IsInline {
+				continue
+			}
+			contentType := http.DetectContentType(attachment.Data)
+			h := make(textproto.MIMEHeader)
+			h.Set("Content-Type", fmt.Sprintf("%s; name=\"%s\"", contentType, attachment.Filename))
 			h.Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", attachment.Filename))
 			h.Set("Content-Transfer-Encoding", "base64")
 
@@ -200,20 +301,7 @@ func (m *Message) buildMIME() (string, error) {
 			if err != nil {
 				return "", err
 			}
-
-			// Encode attachment to base64 line-by-line (chunk size 76)
-			b64Data := make([]byte, base64.StdEncoding.EncodedLen(len(attachment.Data)))
-			base64.StdEncoding.Encode(b64Data, attachment.Data)
-
-			chunkSize := 76
-			for i := 0; i < len(b64Data); i += chunkSize {
-				end := i + chunkSize
-				if end > len(b64Data) {
-					end = len(b64Data)
-				}
-				part.Write(b64Data[i:end])
-				part.Write([]byte("\r\n"))
-			}
+			writeBase64(part, attachment.Data)
 		}
 		mixedWriter.Close()
 	}
@@ -240,6 +328,21 @@ func writeSinglePart(w interface{}, contentType, body string) {
 		buf := w.(*bytes.Buffer)
 		fmt.Fprintf(buf, "Content-Type: %s; charset=\"UTF-8\"\r\n\r\n", contentType)
 		buf.WriteString(body)
+	}
+}
+
+func writeBase64(w io.Writer, data []byte) {
+	b64Data := make([]byte, base64.StdEncoding.EncodedLen(len(data)))
+	base64.StdEncoding.Encode(b64Data, data)
+
+	chunkSize := 76
+	for i := 0; i < len(b64Data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(b64Data) {
+			end = len(b64Data)
+		}
+		w.Write(b64Data[i:end])
+		w.Write([]byte("\r\n"))
 	}
 }
 

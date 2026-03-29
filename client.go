@@ -9,12 +9,19 @@ import (
 	"google.golang.org/api/option"
 )
 
+// Sender defines the interface for sending email messages.
+// This allows for easier mocking in tests.
+type Sender interface {
+	NewMessage() *Message
+}
+
 // Client is a safe, concurrent Gmail API client configured with strict rate limiting
 // to protect the user's account from quota bans.
 type Client struct {
-	srv     *gmail.Service
-	limiter *RateLimiter
-	mu      sync.RWMutex // Protects state if needed for concurrent modifications
+	srv       *gmail.Service
+	limiter   *RateLimiter
+	autoRetry bool
+	mu        sync.RWMutex // Protects state if needed for concurrent modifications
 }
 
 // ClientOption defines an option for customizing the Client.
@@ -24,6 +31,13 @@ type ClientOption func(*Client)
 func WithRateLimiter(rl *RateLimiter) ClientOption {
 	return func(c *Client) {
 		c.limiter = rl
+	}
+}
+
+// WithAutoRetry enables automatic waiting when rate limits (internal or 429) are hit.
+func WithAutoRetry() ClientOption {
+	return func(c *Client) {
+		c.autoRetry = true
 	}
 }
 
